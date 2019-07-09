@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+import os
+import sys
+import re
+import argparse
+from functools import partial
+from bs4 import BeautifulSoup
+from termcolor import colored
+
+kafka_doc_dir = 'kafka-docs'
+
+bold = partial(colored, attrs=['bold'])
+green = partial(colored, color='green')
+greenb = partial(colored, color='green', attrs=['bold'])
+cyanb = partial(colored, color='cyan', attrs=['bold'])
+blueb = partial(colored, color='blue', attrs=['bold'])
+yellowbu = partial(colored, color='yellow', attrs=['bold', 'underline'])
+whited = partial(colored, color='white', attrs=['dark'])
+
+def get_doc_version():
+    kafka_doc_dir_absolute = os.path.join(os.path.dirname(os.path.realpath(__file__)), kafka_doc_dir)
+    kafka_doc_dir_resolved = os.path.realpath(kafka_doc_dir_absolute)
+    kafka_doc_version = '.'.join(list(kafka_doc_dir_resolved.split('/')[-2]))
+    return kafka_doc_version
+
+def get_available_docs():
+    kafka_doc_dir_absolute = os.path.join(os.path.dirname(os.path.realpath(__file__)), kafka_doc_dir)
+    try:
+        all_docs = os.listdir(kafka_doc_dir_absolute)
+    except:
+        print(f"Cannot find docs from '{kafka_doc_dir_absolute}'", file=sys.stderr)
+        all_docs = []
+    config_docs = [d for d in all_docs if d.endswith('_config.html')]
+    config_docs_name = [re.sub('_config.html$', '', d) for d in config_docs]
+    return config_docs_name
+
+def _colorize_description_tag(t):
+    if isinstance(t, str):
+        return t
+    elif t.name == 'code':
+        return(cyanb(t.text))
+    elif t.name == 'a':
+        return(yellowbu(t.text))
+    elif t.name == 'p':
+        return(t.text + '\n')
+    elif t.name == 'br':
+        return(t.text + '\n')
+    # ad-hoc and manual processing, because the snippet is also hand-written 
+    elif t.name == 'ul':
+        txt = re.sub('<li>', r'\n- ', repr(t)) # make <li> into list
+        txt = re.sub('<code>(.*?)</code>', lambda x:cyanb(x.group(1)), txt) # highlight code
+        txt = re.sub('</li>', '', txt) # remove any </li>
+        txt = re.sub('</?ul>', '', txt) # remove any <ul> or </ul> tag
+        return txt
+    else:
+        # this is for debug
+        # print(f"Did not process tag '{t.name}' for {t}", file=sys.stderr)
+        return repr(t)
+
+def render_name(doc_name, headers, entry):
+    ...
+
+def render_raw(doc_name, headers, entry):
+    ...
+
+def render_details(doc_name, headers, entry):
+    entry_d = {k:v for k, v in zip(headers, entry)}
+    rendered = []
+    rendered.append(green(f"({doc_name} conf)") + " " + greenb(entry_d['name'].text) + f" [= {blueb(entry_d['default'].text)}]")
+    # grepped from all <th>
+    bfr = []
+    for k in ['Type', 'Valid Values', 'Importance', 'Dynamic Update Mode', 'Server Default Property',]:
+        if k.lower() in headers:
+            bfr.append(f"{k} = {entry_d[k.lower()].text}")
+    rendered.append(whited(' | '.join(bfr)))
+    rendered.append(''.join(_colorize_description_tag(t) for t in entry_d['description'].children))
+    return '\n'.join(rendered)
+
+def find_config(conf_doc_name, keyword):
+    'Find in a doc and return all entries that match the keyword'
+    assert conf_doc_name in get_available_docs(), f"'{conf_doc_name}' is not found. Available docs are: {', '.join([f'`{i}`' for i in get_available_docs()])}"
+
+    # TODO pre-process these
+    doc_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), kafka_doc_dir, f"{conf_doc_name}_config.html")
+    doc_contents = open(doc_location).read().replace('</td></td>', '</td>') # KAFKA-8633
+    conf = BeautifulSoup(doc_contents, "html.parser")
+
+    table_headers = [th.text.lower() for th in conf.findAll("th")]
+
+    matched_confs = []
+    for tr in conf.findAll("tr"):
+        # skip table heads
+        if not tr.findAll("td"):
+            continue
+
+        entry = tr.findAll("td")
+        entry_d = {k:v for k, v in zip(table_headers, entry)}
+
+        if re.search(keyword, entry_d['name'].text, re.I):
+            matched_confs.append([conf_doc_name, table_headers, entry])
+
+    return matched_confs
+
+def find_config_alldoc(keyword):
+    results = []
+    for doc_name in get_available_docs():
+        results.extend(find_config(doc_name, keyword))
+    return results
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('-d', '--doc', default='kafka', help=f"Specify the document to search. Default to `kafka`(broker). Valid options: `all`, {', '.join([f'`{i}`' for i in get_available_docs()])}")
+    parser.add_argument('-f', '--format', default='details', help='Specify a printing format from `name`, `details`, `raw`. Default to `name`')
+    parser.add_argument('keyword')
+    args = parser.parse_args()
+
+    # TODO to implement
+    if args.format != 'details':
+        print(f"Woops, the format '{args.format}' is not implemented yet. I'm dying.", file=sys.stderr)
+        exit(1)
+
+    print(f"=== searching {bold(args.doc)} docs from version {bold(get_doc_version())} ===", end='\n\n', file=sys.stderr)
+    if args.doc == 'all':
+        results = find_config_alldoc(args.keyword)
+    else:
+        results = find_config(args.doc, args.keyword)
+    # each result should be [doc_name, header, entry(bs4 tr element)]
+    for result in results:
+        print(render_details(*result), end='\n\n')
+
+if __name__ == '__main__':
+    main()
