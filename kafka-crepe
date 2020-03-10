@@ -4,7 +4,7 @@ import sys
 import re
 import argparse
 from functools import partial
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, element
 from termcolor import colored
 
 kafka_doc_dir = 'kafka-docs'
@@ -45,7 +45,7 @@ def _colorize_description_tag(t):
         return(t.text + '\n')
     elif t.name == 'br':
         return(t.text + '\n')
-    # ad-hoc and manual processing, because the snippet is also hand-written 
+    # ad-hoc and manual processing, because the snippet is also hand-written
     elif t.name == 'ul':
         txt = re.sub('<li>', r'\n- ', repr(t)) # make <li> into list
         txt = re.sub('<code>(.*?)</code>', lambda x:cyanb(x.group(1)), txt) # highlight code
@@ -57,47 +57,82 @@ def _colorize_description_tag(t):
         # print(f"Did not process tag '{t.name}' for {t}", file=sys.stderr)
         return repr(t)
 
-def render_name(doc_name, headers, entry):
-    ...
+def render_name(doc_name, entry):
+    return f"({doc_name} conf) {entry['name']}"
 
-def render_raw(doc_name, headers, entry):
-    ...
-
-def render_details(doc_name, headers, entry):
-    entry_d = {k:v for k, v in zip(headers, entry)}
+def render_details(doc_name, entry):
     rendered = []
-    rendered.append(green(f"({doc_name} conf)") + " " + greenb(entry_d['name'].text) + f" [= {blueb(entry_d['default'].text)}]")
+    rendered.append(green(f"({doc_name} conf)") + " " + greenb(entry['name']) + f" [= {blueb(entry['default'])}]")
     # grepped from all <th>
     bfr = []
-    for k in ['Type', 'Valid Values', 'Importance', 'Dynamic Update Mode', 'Server Default Property',]:
-        if k.lower() in headers:
-            bfr.append(f"{k} = {entry_d[k.lower()].text}")
+    for k in ['Type', 'Valid Values', 'Importance', 'Update Mode', 'Server Default Property',]:
+        if k.lower() in entry.keys():
+            bfr.append(f"{k} = {entry[k.lower()]}")
     rendered.append(whited(' | '.join(bfr)))
-    rendered.append(''.join(_colorize_description_tag(t) for t in entry_d['description'].children))
+    rendered.append(''.join(_colorize_description_tag(t) for t in entry['description'].children))
     return '\n'.join(rendered)
+
+def adhoc_fix_doc24(doc, doc_name):
+    if doc_name == 'kafka':
+        fixed_doc = doc \
+            .replace('<br>When used together', '<br/>When used together') \
+            .replace('<user, <client-id>', '[user], [client-id]') \
+            .replace('<user>', '[user]') \
+            .replace('<client-id>', '[client-id]') \
+            .replace('<user, client-id>', '[user, client-id]')
+    elif doc_name == 'producer':
+        fixed_doc = doc \
+            .replace('in-flight requests.', 'in-flight requests.</p>') \
+            .replace('larger than this size. <p>', 'larger than this size. </p><p>') \
+            .replace('available to be sent. <p>', 'available to be sent. </p><p>') \
+            .replace('additional records.<br/>', 'additional records.</p><br/>')
+    elif doc_name == 'consumer':
+        fixed_doc = doc \
+            .replace('return the LSO<br/>', 'return the LSO</p><br/>')
+    elif doc_name == 'topic':
+        fixed_doc = doc \
+            .replace('<br>When used together', '<br/>When used together')
+    elif doc_name == 'streams':
+        fixed_doc = doc \
+            .replace('<client.id>-StreamThread-<threadSequenceNumber>-<consumer|producer|restore-consumer>',
+                '[client.id]-StreamThread-[threadSequenceNumber]-[consumer|producer|restore-consumer]')
+    else:
+        fixed_doc = doc
+    return fixed_doc
 
 def find_config(conf_doc_name, keyword):
     'Find in a doc and return all entries that match the keyword'
+
     assert conf_doc_name in get_available_docs(), f"'{conf_doc_name}' is not found. Available docs are: {', '.join([f'`{i}`' for i in get_available_docs()])}"
 
     # TODO pre-process these
     doc_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), kafka_doc_dir, f"{conf_doc_name}_config.html")
-    doc_contents = open(doc_location).read().replace('</td></td>', '</td>') # KAFKA-8633
+    doc_contents = adhoc_fix_doc24(open(doc_location).read(), conf_doc_name)
     conf = BeautifulSoup(doc_contents, "html.parser")
 
-    table_headers = [th.text.lower() for th in conf.findAll("th")]
+    conf_list = conf.find("ul", recursive=False).find_all("li", recursive=False)
 
     matched_confs = []
-    for tr in conf.findAll("tr"):
-        # skip table heads
-        if not tr.findAll("td"):
-            continue
+    for _conf in conf_list:
+        conf = _conf.contents
+        assert conf[0].name == 'b', str(conf)
+        assert conf[-2].name == 'br', str(conf)
+        assert conf[-1].name == 'ul', str(conf)
+        assert conf[-1].attrs['class'] == ['horizontal-list'], str(conf)
 
-        entry = tr.findAll("td")
-        entry_d = {k:v for k, v in zip(table_headers, entry)}
+        entry = {}
+        name, *description, br, attributes = conf
+        entry['name'] = name.text
+        entry['description'] = BeautifulSoup(''.join(map(str, description)).lstrip(' :'), "html.parser")
+        for attribute in attributes.contents:
+            k, v = attribute.contents
+            assert k.name == 'b'
+            assert k.text in ['Type', 'Valid Values', 'Importance', 'Update Mode', 'Server Default Property', 'Default'], k.text
+            assert type(v) == element.NavigableString
+            entry[k.text.lower()] = str(v).lstrip(' :')
 
-        if re.search(keyword, entry_d['name'].text, re.I):
-            matched_confs.append([conf_doc_name, table_headers, entry])
+        if re.search(keyword, entry['name'], re.I):
+            matched_confs.append([conf_doc_name, entry])
 
     return matched_confs
 
@@ -111,14 +146,19 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('-d', '--doc', default='kafka', help=f"Specify the document to search. Default to `kafka`(broker). Valid options: `all`, {', '.join([f'`{i}`' for i in get_available_docs()])}")
-    parser.add_argument('-f', '--format', default='details', help='Specify a printing format from `name`, `details`, `raw`. Default to `name`')
+    parser.add_argument('-f', '--format', default='details', help='Specify a printing format from `name`, `details`. Default to `details`')
     parser.add_argument('keyword')
     args = parser.parse_args()
 
     # TODO to implement
-    if args.format != 'details':
+    if args.format not in ('name', 'details',):
         print(f"Woops, the format '{args.format}' is not implemented yet. I'm dying.", file=sys.stderr)
         exit(1)
+
+    if get_doc_version() not in ('2.4', '2.5', '2.6',):
+        print(f"Due to the format change in 2.4 documentation, this only supports 2.4~ doc. Checkout an old git version to grep ~2.3 doc.", file=sys.stderr)
+        exit(1)
+
 
     print(f"=== searching {bold(args.doc)} docs from version {bold(get_doc_version())} ===", end='\n\n', file=sys.stderr)
     if args.doc == 'all':
@@ -127,7 +167,10 @@ def main():
         results = find_config(args.doc, args.keyword)
     # each result should be [doc_name, header, entry(bs4 tr element)]
     for result in results:
-        print(render_details(*result), end='\n\n')
+        if args.format == 'name':
+            print(render_name(*result), end='\n')
+        else:
+            print(render_details(*result), end='\n\n')
 
 if __name__ == '__main__':
     main()
